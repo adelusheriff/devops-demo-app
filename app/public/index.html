@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>devops-demo-app</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 48px 24px;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  .eyebrow {
+    color: var(--muted);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 32px; font-size: 15px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  .row:last-child { border-bottom: none; }
+  .label { color: var(--muted); }
+  .value { font-family: "SF Mono", Consolas, monospace; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge.ok { background: rgba(63,185,80,0.15); color: var(--ok); }
+  .badge.warn { background: rgba(210,153,34,0.15); color: var(--warn); }
+  .badge.err { background: rgba(248,81,73,0.15); color: var(--err); }
+  .badge.loading { background: rgba(139,148,158,0.15); color: var(--muted); }
+  .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+  }
+  .links { display: flex; gap: 12px; margin-top: 24px; }
+  .links a {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 13px;
+    font-family: "SF Mono", Consolas, monospace;
+    border: 1px solid var(--border);
+    padding: 8px 14px;
+    border-radius: 6px;
+  }
+  .links a:hover { border-color: var(--accent); }
+  .footer { margin-top: 32px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="eyebrow">devops-demo-app</div>
+    <h1>Service status</h1>
+    <div class="sub">Deployed via GitHub Actions &rarr; ECR &rarr; SSM. This page reads live data from the API below.</div>
+
+    <div class="card">
+      <div class="row">
+        <span class="label">Health</span>
+        <span id="health-badge" class="badge loading"><span class="dot"></span>checking&hellip;</span>
+      </div>
+      <div class="row">
+        <span class="label">Database</span>
+        <span id="db-badge" class="badge loading"><span class="dot"></span>checking&hellip;</span>
+      </div>
+      <div class="row">
+        <span class="label">Version (commit SHA)</span>
+        <span id="version" class="value">&hellip;</span>
+      </div>
+      <div class="row">
+        <span class="label">Uptime</span>
+        <span id="uptime" class="value">&hellip;</span>
+      </div>
+    </div>
+
+    <div class="links">
+      <a href="/health">/health</a>
+      <a href="/api/tasks">/api/tasks</a>
+      <a href="/api/info">/api/info</a>
+    </div>
+
+    <div class="footer">Auto-refreshes every 5s &middot; <span id="last-checked">&ndash;</span></div>
+  </div>
+
+<script>
+  function setBadge(el, state, text) {
+    el.className = 'badge ' + state;
+    el.innerHTML = '<span class="dot"></span>' + text;
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch('/health');
+      const data = await res.json();
+
+      setBadge(document.getElementById('health-badge'),
+        data.status === 'ok' ? 'ok' : 'warn',
+        data.status);
+
+      const dbStatus = data.db && data.db.status;
+      setBadge(document.getElementById('db-badge'),
+        dbStatus === 'connected' ? 'ok' : dbStatus === 'error' ? 'err' : 'warn',
+        dbStatus || 'unknown');
+
+      document.getElementById('uptime').textContent = Math.floor(data.uptime_seconds) + 's';
+
+      const infoRes = await fetch('/api/info');
+      const info = await infoRes.json();
+      document.getElementById('version').textContent = info.version;
+
+      document.getElementById('last-checked').textContent =
+        'last checked ' + new Date().toLocaleTimeString();
+    } catch (err) {
+      setBadge(document.getElementById('health-badge'), 'err', 'unreachable');
+      setBadge(document.getElementById('db-badge'), 'err', 'unreachable');
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+</script>
+</body>
+</html>

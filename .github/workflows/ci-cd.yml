@@ -1,0 +1,239 @@
+name: CI/CD - devops-demo-app
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Required for GitHub -> AWS OIDC. No AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+# secret exists anywhere in this repo - credentials are a short-lived token
+# exchanged at run time, scoped by the IAM trust policy in terraform/main.tf.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. CI - runs on every push AND every PR, targeting either branch.
+  #    A PR from a fork can run this job (it has no AWS permissions
+  #    regardless - see the OIDC trust policy) but cannot reach the
+  #    build/deploy jobs below, which require a direct push event.
+  # ---------------------------------------------------------------------
+  test:
+    name: Lint, Test & Audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Dependency vulnerability audit
+        # Fails the build on high/critical known-vulnerable dependencies.
+        # Cheap supply-chain check that costs nothing but a few seconds.
+        run: npm audit --audit-level=high
+
+  # ---------------------------------------------------------------------
+  # 2. Determine target environment from the branch. develop -> staging,
+  #    main -> production. Everything downstream reads this instead of
+  #    re-checking github.ref, so the logic lives in exactly one place.
+  # ---------------------------------------------------------------------
+  resolve-environment:
+    name: Resolve Environment
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      tag_prefix: ${{ steps.resolve.outputs.tag_prefix }}
+      port: ${{ steps.resolve.outputs.port }}
+    steps:
+      - id: resolve
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "tag_prefix=prod" >> "$GITHUB_OUTPUT"
+            echo "port=80" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+            echo "tag_prefix=staging" >> "$GITHUB_OUTPUT"
+            echo "port=8080" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------
+  # 3. Build, scan, and push to ECR. Uses the GitHub environment (staging
+  #    or production) so production's protection rules - required
+  #    reviewer, wait timer - apply here too, not just at deploy time.
+  # ---------------------------------------------------------------------
+  build-and-push:
+    name: Build, Scan & Push Image
+    needs: resolve-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-environment.outputs.environment }}
+    outputs:
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          TAG="${{ needs.resolve-environment.outputs.tag_prefix }}-${{ github.sha }}"
+          IMAGE_URI="${{ vars.ECR_REPOSITORY_URL }}:$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ steps.meta.outputs.image_uri }}
+            ${{ vars.ECR_REPOSITORY_URL }}:${{ needs.resolve-environment.outputs.tag_prefix }}-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1' # fails the job - a critical/high CVE blocks deployment
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------------
+  # 4. Deploy via SSM Run Command - no SSH key, no open port 22. The
+  #    command runs on the instance under its own IAM role and is fully
+  #    logged (who ran it, when, output) in the SSM console / CloudTrail.
+  # ---------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    needs: [resolve-environment, build-and-push]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-environment.outputs.environment }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy container via SSM
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          ENVIRONMENT: ${{ needs.resolve-environment.outputs.environment }}
+          PORT: ${{ needs.resolve-environment.outputs.port }}
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          # Only ever present in the job's memory and in this one SSM
+          # command's parameters (visible to anyone with ssm:GetCommandInvocation
+          # on this instance, same as an SSH deploy script would be) - never
+          # written to a file or logged. Staging/prod pull whichever pair
+          # of secrets matches the resolved environment.
+          STAGING_DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+          PROD_DB_HOST: ${{ vars.PROD_DB_HOST }}
+          PROD_DB_NAME: ${{ vars.PROD_DB_NAME }}
+          PROD_DB_USER: ${{ vars.PROD_DB_USER }}
+          PROD_DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
+        run: |
+          CONTAINER_NAME="app-${ENVIRONMENT}"
+          REGISTRY_HOST="$(echo "$IMAGE_URI" | cut -d/ -f1)"
+
+          if [ "$ENVIRONMENT" = "staging" ]; then
+            DB_ARGS="--network appnet -e DB_HOST=staging-db -e DB_PORT=5432 -e DB_NAME=devops_demo_staging -e DB_USER=staging_app -e DB_PASSWORD=$STAGING_DB_PASSWORD"
+          else
+            DB_ARGS="-e DB_HOST=$PROD_DB_HOST -e DB_PORT=5432 -e DB_NAME=$PROD_DB_NAME -e DB_USER=$PROD_DB_USER -e DB_PASSWORD=$PROD_DB_PASSWORD"
+          fi
+
+          # Build the remote script as a JSON array so quoting is handled
+          # by jq rather than by hand - the classic source of broken
+          # SSM/SSH deploy scripts. The actual secret values are baked in
+          # here (client-side), not referenced as remote env vars that
+          # would never exist on the instance.
+          COMMANDS=$(jq -nc \
+            --arg image "$IMAGE_URI" \
+            --arg name "$CONTAINER_NAME" \
+            --arg port "$PORT" \
+            --arg region "$AWS_REGION" \
+            --arg registry "$REGISTRY_HOST" \
+            --arg dbargs "$DB_ARGS" \
+            '[
+              "set -e",
+              ("aws ecr get-login-password --region " + $region + " | docker login --username AWS --password-stdin " + $registry),
+              ("docker pull " + $image),
+              ("docker stop " + $name + " || true"),
+              ("docker rm " + $name + " || true"),
+              ("docker run -d --name " + $name + " --restart unless-stopped -p " + $port + ":3000 " + $dbargs + " " + $image),
+              ("for i in $(seq 1 10); do STATUS=$(docker inspect --format={{.State.Health.Status}} " + $name + " || echo starting); echo attempt-$i:$STATUS; [ \"$STATUS\" = healthy ] && echo DEPLOY_OK && exit 0; sleep 5; done; echo DEPLOY_TIMEOUT; docker logs " + $name + "; exit 1")
+            ]')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=$COMMANDS" \
+            --comment "Deploy $CONTAINER_NAME from GitHub Actions run ${{ github.run_id }}" \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM command: $COMMAND_ID"
+
+          # Poll until the command finishes, then surface its output and
+          # exit non-zero if the deploy script itself failed.
+          for i in $(seq 1 20); do
+            sleep 6
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "  poll $i: $STATUS"
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              break
+            fi
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query "StandardOutputContent" --output text
+
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query "StandardErrorContent" --output text
+            exit 1
+          fi
