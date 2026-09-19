@@ -41,7 +41,7 @@ data "aws_subnets" "default" {
 
 data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["099720109477"] # Canonical
+  owners      = ["099720109477"] 
 
   filter {
     name   = "name"
@@ -73,11 +73,10 @@ resource "aws_iam_role" "github_actions" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        StringLike = {
+                StringLike = {
           "token.actions.githubusercontent.com:sub" = [
-            "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
-            "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/develop",
-            "repo:${var.github_org}/${var.github_repo}:pull_request",
+            "repo:${var.github_org}@*/${var.github_repo}@*:environment:staging",
+            "repo:${var.github_org}@*/${var.github_repo}@*:environment:production",
           ]
         }
       }

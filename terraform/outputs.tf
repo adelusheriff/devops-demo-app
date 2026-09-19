@@ -4,7 +4,7 @@ output "app_public_ip" {
 }
 
 output "ec2_instance_id" {
-  description = "Used by GitHub Actions to target ssm send-command, and for `aws ssm start-session` when debugging"
+  description = "Used by GitHub Actions to target ssm send-command, and for `aws ssm start-session` when debuggin"
   value       = aws_instance.app.id
 }
 
