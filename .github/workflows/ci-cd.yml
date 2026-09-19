@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [main, develop]
 
-# Required for GitHub -> AWS OIDC. No AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
-# secret exists anywhere in this repo - credentials are a short-lived token
-# exchanged at run time, scoped by the IAM trust policy in terraform/main.tf.
 permissions:
   id-token: write
   contents: read
@@ -21,12 +18,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------------
-  # 1. CI - runs on every push AND every PR, targeting either branch.
-  #    A PR from a fork can run this job (it has no AWS permissions
-  #    regardless - see the OIDC trust policy) but cannot reach the
-  #    build/deploy jobs below, which require a direct push event.
-  # ---------------------------------------------------------------------
   test:
     name: Lint, Test & Audit
     runs-on: ubuntu-latest
@@ -52,15 +43,8 @@ jobs:
         run: npm test
 
       - name: Dependency vulnerability audit
-        # Fails the build on high/critical known-vulnerable dependencies.
-        # Cheap supply-chain check that costs nothing but a few seconds.
         run: npm audit --audit-level=high
 
-  # ---------------------------------------------------------------------
-  # 2. Determine target environment from the branch. develop -> staging,
-  #    main -> production. Everything downstream reads this instead of
-  #    re-checking github.ref, so the logic lives in exactly one place.
-  # ---------------------------------------------------------------------
   resolve-environment:
     name: Resolve Environment
     needs: test
@@ -83,11 +67,6 @@ jobs:
             echo "port=8080" >> "$GITHUB_OUTPUT"
           fi
 
-  # ---------------------------------------------------------------------
-  # 3. Build, scan, and push to ECR. Uses the GitHub environment (staging
-  #    or production) so production's protection rules - required
-  #    reviewer, wait timer - apply here too, not just at deploy time.
-  # ---------------------------------------------------------------------
   build-and-push:
     name: Build, Scan & Push Image
     needs: resolve-environment
@@ -133,18 +112,13 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
           image-ref: ${{ steps.meta.outputs.image_uri }}
           severity: 'CRITICAL,HIGH'
-          exit-code: '1' # fails the job - a critical/high CVE blocks deployment
+          exit-code: '1'
           ignore-unfixed: true
 
-  # ---------------------------------------------------------------------
-  # 4. Deploy via SSM Run Command - no SSH key, no open port 22. The
-  #    command runs on the instance under its own IAM role and is fully
-  #    logged (who ran it, when, output) in the SSM console / CloudTrail.
-  # ---------------------------------------------------------------------
   deploy:
     name: Deploy
     needs: [resolve-environment, build-and-push]
@@ -163,11 +137,6 @@ jobs:
           ENVIRONMENT: ${{ needs.resolve-environment.outputs.environment }}
           PORT: ${{ needs.resolve-environment.outputs.port }}
           INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-          # Only ever present in the job's memory and in this one SSM
-          # command's parameters (visible to anyone with ssm:GetCommandInvocation
-          # on this instance, same as an SSH deploy script would be) - never
-          # written to a file or logged. Staging/prod pull whichever pair
-          # of secrets matches the resolved environment.
           STAGING_DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
           PROD_DB_HOST: ${{ vars.PROD_DB_HOST }}
           PROD_DB_NAME: ${{ vars.PROD_DB_NAME }}
@@ -183,11 +152,6 @@ jobs:
             DB_ARGS="-e DB_HOST=$PROD_DB_HOST -e DB_PORT=5432 -e DB_NAME=$PROD_DB_NAME -e DB_USER=$PROD_DB_USER -e DB_PASSWORD=$PROD_DB_PASSWORD"
           fi
 
-          # Build the remote script as a JSON array so quoting is handled
-          # by jq rather than by hand - the classic source of broken
-          # SSM/SSH deploy scripts. The actual secret values are baked in
-          # here (client-side), not referenced as remote env vars that
-          # would never exist on the instance.
           COMMANDS=$(jq -nc \
             --arg image "$IMAGE_URI" \
             --arg name "$CONTAINER_NAME" \
@@ -214,8 +178,6 @@ jobs:
 
           echo "SSM command: $COMMAND_ID"
 
-          # Poll until the command finishes, then surface its output and
-          # exit non-zero if the deploy script itself failed.
           for i in $(seq 1 20); do
             sleep 6
             STATUS=$(aws ssm get-command-invocation \
