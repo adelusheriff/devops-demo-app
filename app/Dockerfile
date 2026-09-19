@@ -1,23 +1,24 @@
-# --- Build stage: install deps with dev dependencies available for tests ---
 FROM node:20-alpine AS build
 WORKDIR /usr/src/app
 COPY package*.json ./
 RUN npm install
 COPY . .
 
-# --- Runtime stage: only production deps, smaller final image ---
 FROM node:20-alpine AS runtime
 WORKDIR /usr/src/app
 ENV NODE_ENV=production
 
+RUN apk update && apk upgrade --no-cache
+
 COPY package*.json ./
-RUN npm install --omit=dev && npm cache clean --force
+RUN npm install --omit=dev && npm cache clean --force \
+  && rm -rf /usr/local/lib/node_modules/npm \
+            /usr/local/lib/node_modules/corepack \
+            /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 
 COPY --from=build /usr/src/app/src ./src
 COPY --from=build /usr/src/app/public ./public
 
-# Run as a non-root user (security best practice, and avoids the classic
-# "container runs as root" finding in any infra review)
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
 
