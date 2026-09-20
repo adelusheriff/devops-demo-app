@@ -149,7 +149,7 @@ jobs:
           if [ "$ENVIRONMENT" = "staging" ]; then
             DB_ARGS="--network appnet -e DB_HOST=staging-db -e DB_PORT=5432 -e DB_NAME=devops_demo_staging -e DB_USER=staging_app -e DB_PASSWORD=$STAGING_DB_PASSWORD"
           else
-            DB_ARGS="-e DB_HOST=$PROD_DB_HOST -e DB_PORT=5432 -e DB_NAME=$PROD_DB_NAME -e DB_USER=$PROD_DB_USER -e DB_PASSWORD=$PROD_DB_PASSWORD"
+            DB_ARGS="-e DB_HOST=$PROD_DB_HOST -e DB_PORT=5432 -e DB_NAME=$PROD_DB_NAME -e DB_USER=$PROD_DB_USER -e DB_PASSWORD=$PROD_DB_PASSWORD -e DB_SSL=true"
           fi
 
           COMMANDS=$(jq -nc \
